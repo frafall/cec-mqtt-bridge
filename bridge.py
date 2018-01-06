@@ -29,6 +29,8 @@ config = {
     }
 }
 
+def mqtt_on_disconnect(client, obj, rc):
+    print('Not able to connect (error %d)' %(rc))
 
 def mqtt_on_connect(client, userdata, flags, rc):
     """@type client: paho.mqtt.client """
@@ -192,7 +194,7 @@ def ir_listen_thread():
 
 
 def ir_send(remote, key):
-    subprocess.call(["irsend", "SEND_ONCE", remote, key])
+    subprocess.call(["irsend", "--device=/var/run/lirc/lircd.socket", "SEND_ONCE", remote, key])
 
 
 def cec_refresh():
@@ -273,10 +275,11 @@ try:
     print("Initialising MQTT...")
     mqtt_client = mqtt.Client("cec-ir-mqtt")
     mqtt_client.on_connect = mqtt_on_connect
+    mqtt_client.on_disconnect = mqtt_on_disconnect
     mqtt_client.on_message = mqtt_on_message
     if config['mqtt']['user']:
         mqtt_client.username_pw_set(config['mqtt']['user'], password=config['mqtt']['password']);
-    mqtt_client.connect(config['mqtt']['broker'], config['mqtt']['port'], 60)
+    mqtt_client.connect(config['mqtt']['broker'], int(config['mqtt']['port']), 60)
     mqtt_client.loop_start()
 
     print("Starting main loop...")
@@ -286,7 +289,9 @@ try:
         time.sleep(10)
 
 except KeyboardInterrupt:
+    print("KeyboardInterrupt")
     cleanup()
 
 except RuntimeError:
+    print("RuntimeError")
     cleanup()
