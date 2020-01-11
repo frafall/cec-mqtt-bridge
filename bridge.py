@@ -13,10 +13,12 @@ import os
 config = {
     'mqtt': {
         'broker': 'localhost',
+        'devicename': 'cec-ir-mqtt',
         'port': 1883,
         'prefix': 'media',
         'user': os.environ.get('MQTT_USER'),
         'password': os.environ.get('MQTT_PASSWORD'),
+        'tls': 0,
     },
     'cec': {
         'enabled': 0,
@@ -42,6 +44,7 @@ def mqtt_on_connect(client, userdata, flags, rc):
         client.subscribe([
             (config['mqtt']['prefix'] + '/cec/cmd', 0),
             (config['mqtt']['prefix'] + '/cec/+/cmd', 0),
+            (config['mqtt']['prefix'] + '/cec/+/set', 0),
             (config['mqtt']['prefix'] + '/cec/tx', 0)
         ])
 
@@ -50,6 +53,9 @@ def mqtt_on_connect(client, userdata, flags, rc):
         client.subscribe([
             (config['mqtt']['prefix'] + '/ir/+/tx', 0)
         ])
+
+    # Publish birth message
+    client.publish(config['mqtt']['prefix'] + '/bridge/status', 'online', qos=1, retain=True)
 
 
 def mqtt_on_message(client, userdata, message):
@@ -71,18 +77,22 @@ def mqtt_on_message(client, userdata, message):
 
                 if action == 'mute':
                     cec_client.AudioMute()
+                    cec_send('71', id=5)
                     return
 
                 if action == 'unmute':
                     cec_client.AudioUnmute()
+                    cec_send('71', id=5)
                     return
 
                 if action == 'voldown':
                     cec_client.VolumeDown()
+                    cec_send('71', id=5)
                     return
 
                 if action == 'volup':
                     cec_client.VolumeUp()
+                    cec_send('71', id=5)
                     return
 
                 raise Exception("Unknown command (%s)" % action)
@@ -93,6 +103,43 @@ def mqtt_on_message(client, userdata, message):
                     print(" Sending raw: %s" % command)
                     cec_send(command)
                 return
+
+            if split[2] == 'set':
+
+                if split[1] == 'volume':
+                    action = int(message.payload.decode())
+
+                    if action >= 0 and action <= 100:
+                        volume = cec_volume()
+
+                        # Attempt to set the correct volume, but try to avoid a never-ending loop due to rounding issues
+                        attempts = 0
+                        while volume != action and attempts <= 10:
+                            diff = abs(volume - action)
+
+                            # Run a bulk of vol up/down actions to close a large gap at first (inaccurate, but quick)
+                            if diff >= 10:
+                                for _ in range(round(diff / 2.5)):
+                                    if volume < action:
+                                        cec_client.VolumeUp()
+                                    else:
+                                        cec_client.VolumeDown()
+
+                            # Set the volume precisely after the bulk operations, try to avoid an endless loop due to rounding
+                            else:
+                                if volume < action:
+                                    cec_client.VolumeUp()
+                                else:
+                                    cec_client.VolumeDown()
+
+                            # Refresh the volume levels and wait for the value to return before each loop
+                            cec_send('71', id=5)
+                            time.sleep(.2)
+                            volume = cec_volume()
+                            attempts += 1
+                        return
+
+                    raise Exception("Unknown command (%s)" % action)
 
             if split[2] == 'cmd':
 
@@ -164,6 +211,34 @@ def cec_on_message(level, time, message):
             mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), power, True)
             return
 
+        # Report Audio Status
+        m = re.search('>> ([0-9a-f])[0-9a-f]:7a:([0-9a-f]{2})', message)
+        if m:
+            volume = None
+            mute = None
+
+            audio_status = int(m.group(2), 16)
+            if audio_status <= 100:
+                volume = audio_status
+                mute = 'off'
+            elif audio_status >= 128:
+                volume = audio_status - 128
+                mute = 'on'
+
+            if isinstance(volume, int):
+                mqtt_send(config['mqtt']['prefix'] + '/cec/volume', volume, True)
+            if mute:
+                mqtt_send(config['mqtt']['prefix'] + '/cec/mute', mute, True)
+            return
+
+
+def cec_volume():
+    audio_status = cec_client.AudioStatus()
+    if audio_status <= 100:
+        return audio_status
+    elif audio_status >= 128:
+        return audio_status - 128
+
 
 def cec_send(cmd, id=None):
     if id is None:
@@ -202,12 +277,15 @@ def cec_refresh():
         for id in config['cec']['devices'].split(','):
             cec_send('8F', id=int(id))
 
+        cec_send('71', id=5)
+
     except Exception as e:
         print("Error during refreshing: ", str(e))
 
 
 def cleanup():
     mqtt_client.loop_stop()
+    mqtt_client.publish(config['mqtt']['prefix'] + '/bridge/status', 'offline', qos=1, retain=True)
     mqtt_client.disconnect()
     if int(config['ir']['enabled']) == 1:
         lirc.deinit()
@@ -273,12 +351,15 @@ try:
 
     ### Setup MQTT ###
     print("Initialising MQTT...")
-    mqtt_client = mqtt.Client("cec-ir-mqtt")
+    mqtt_client = mqtt.Client(config['mqtt']['devicename'])
     mqtt_client.on_connect = mqtt_on_connect
     mqtt_client.on_disconnect = mqtt_on_disconnect
     mqtt_client.on_message = mqtt_on_message
     if config['mqtt']['user']:
         mqtt_client.username_pw_set(config['mqtt']['user'], password=config['mqtt']['password']);
+    if int(config['mqtt']['tls']) == 1:
+        mqtt_client.tls_set();
+    mqtt_client.will_set(config['mqtt']['prefix'] + '/bridge/status', 'offline', qos=1, retain=True)
     mqtt_client.connect(config['mqtt']['broker'], int(config['mqtt']['port']), 60)
     mqtt_client.loop_start()
 
